@@ -1,11 +1,8 @@
-import { useState, useEffect, useReducer, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useReducer, useCallback, useRef } from 'react';
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 const SIM_DURATION = 600;
 const ORDER_INTERVAL = 60;
-const SYNC_INTERVAL = 500;
-const STORAGE_KEY = 'lego-factory-state';
-const STORAGE_ACTIONS_KEY = 'lego-factory-actions';
 const OVEN_CAPACITY = 8;
 const SECOND_OVEN_COST = 2000;
 const EXPIRED_PENALTY = 50;
@@ -48,50 +45,7 @@ const formatTime = (seconds) => { const m = Math.floor(seconds / 60); const s = 
 const ROOM_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No I,O,0,1 to avoid confusion
 const generateRoomCode = () => Array.from({ length: 4 }, () => ROOM_CHARS[Math.floor(Math.random() * ROOM_CHARS.length)]).join('');
 const getRoomFromURL = () => new URLSearchParams(window.location.search).get('room')?.toUpperCase() || null;
-const getSessionId = (roomCode) => roomCode || 'default';
-const STALE_THRESHOLD = 2 * 60 * 60 * 1000; // 2 hours
-
-function getActiveSessions() {
-  const sessions = [];
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key.startsWith(STORAGE_KEY + '-')) continue;
-      const room = key.replace(STORAGE_KEY + '-', '');
-      if (room === 'default') continue;
-      const raw = localStorage.getItem(key);
-      if (!raw) continue;
-      const state = JSON.parse(raw);
-      if (state.phase !== 'running' && state.phase !== 'staging') continue;
-      if (state._sessionStart && Date.now() - state._sessionStart > STALE_THRESHOLD) continue;
-      const opCount = Object.keys(state.operators || {}).length;
-      sessions.push({ room, round: state.round, opCount, elapsed: state.elapsedTime });
-    }
-  } catch {}
-  return sessions;
-}
-
-function queueAction(sessionId, action) {
-  const key = `${STORAGE_ACTIONS_KEY}-${sessionId}`;
-  try {
-    const existing = JSON.parse(localStorage.getItem(key) || '[]');
-    existing.push({ ...action, _ts: Date.now() });
-    // Keep only last 50 actions to prevent unbounded growth
-    if (existing.length > 50) existing.splice(0, existing.length - 50);
-    localStorage.setItem(key, JSON.stringify(existing));
-  } catch {}
-}
-
-function drainActionQueue(sessionId) {
-  const key = `${STORAGE_ACTIONS_KEY}-${sessionId}`;
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return [];
-    const actions = JSON.parse(raw);
-    if (actions.length > 0) localStorage.setItem(key, '[]');
-    return actions;
-  } catch { return []; }
-}
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
 
 function generateOrder(roundNumber, simTime) {
   const types = ['ALPHA','BETA','GAMMA'];
@@ -1609,7 +1563,23 @@ function Lobby({ onJoin, urlRoom }) {
   const [activeSessions, setActiveSessions] = useState([]);
   const [joinError, setJoinError] = useState('');
 
-  useEffect(() => { setActiveSessions(getActiveSessions()); }, []);
+  // Fetch active rooms from WebSocket server
+  useEffect(() => {
+    let ws;
+    try {
+      ws = new WebSocket(WS_URL);
+      ws.onopen = () => { ws.send(JSON.stringify({ type: 'get_rooms' })); };
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'room_list') setActiveSessions(msg.rooms);
+        } catch {}
+        ws.close();
+      };
+      ws.onerror = () => {};
+    } catch {}
+    return () => { if (ws) ws.close(); };
+  }, []);
 
   const handleCreate = () => {
     const code = generateRoomCode();
@@ -1768,64 +1738,97 @@ function Lobby({ onJoin, urlRoom }) {
 // ─── MAIN APP ────────────────────────────────────────────────────────────────
 export default function App() {
   const [roomCode, setRoomCode] = useState(getRoomFromURL);
-  const sessionId = roomCode || 'default';
   const [state, dispatch] = useReducer(gameReducer, roomCode, createInitialState);
   const [role, setRole] = useState(null);
   const [playerName, setPlayerName] = useState('');
   const [playerId] = useState(genId);
   const intervalRef = useRef(null);
-  const syncRef = useRef(null);
+  const wsRef = useRef(null);
   const stateRef = useRef(state);
+  const roleRef = useRef(role);
 
-  // Keep stateRef in sync for use in interval callbacks (avoids stale closures)
+  // Keep refs in sync
   useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => { roleRef.current = role; }, [role]);
 
-  // ── DIRECTOR: write game state to localStorage (single source of truth) ──
+  // ── WEBSOCKET CONNECTION ──
+  useEffect(() => {
+    if (!role || !roomCode) return;
+
+    let ws;
+    let reconnectTimer;
+    let retryDelay = 500;
+
+    function connect() {
+      ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        retryDelay = 500;
+        // Join the room
+        ws.send(JSON.stringify({ type: 'join', room: roomCode, role, id: playerId, name: playerName }));
+        // If Director, send current state so server has it for late joiners
+        if (roleRef.current === 'director' && stateRef.current.phase !== 'lobby') {
+          ws.send(JSON.stringify({ type: 'state_update', state: stateRef.current }));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+
+        switch (msg.type) {
+          case 'state_update':
+            // Non-directors receive state from Director via server
+            if (roleRef.current !== 'director') {
+              dispatch({ type: 'SET_STATE', state: msg.state });
+            }
+            break;
+          case 'action':
+            // Director receives actions from operators via server
+            if (roleRef.current === 'director') {
+              dispatch(msg.action);
+            }
+            break;
+          case 'client_joined':
+            // Server notifies Director that an operator joined — they'll send ADD_OPERATOR via action
+            break;
+          case 'client_left':
+            // Could remove operator — but they might reconnect, so leave them
+            break;
+        }
+      };
+
+      ws.onclose = () => {
+        wsRef.current = null;
+        // Reconnect with backoff
+        reconnectTimer = setTimeout(() => {
+          retryDelay = Math.min(retryDelay * 2, 5000);
+          connect();
+        }, retryDelay);
+      };
+
+      ws.onerror = () => { ws.close(); };
+    }
+
+    connect();
+
+    return () => {
+      clearTimeout(reconnectTimer);
+      if (ws) { ws.onclose = null; ws.close(); }
+      wsRef.current = null;
+    };
+  }, [role, roomCode, playerId, playerName]);
+
+  // ── DIRECTOR: broadcast state via WebSocket on every change ──
   useEffect(() => {
     if (role !== 'director') return;
     if (state.phase === 'lobby') return;
-    try { localStorage.setItem(`${STORAGE_KEY}-${sessionId}`, JSON.stringify(state)); } catch {}
-  }, [state, role, sessionId]);
-
-  // ── DIRECTOR: poll action queue from operators ──
-  const actionQueueRef = useRef(null);
-  useEffect(() => {
-    if (role !== 'director' || (state.phase !== 'running' && state.phase !== 'staging')) {
-      clearInterval(actionQueueRef.current);
-      return;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'state_update', state }));
     }
-    actionQueueRef.current = setInterval(() => {
-      const actions = drainActionQueue(sessionId);
-      actions.forEach(action => {
-        const { _ts, ...cleanAction } = action;
-        dispatch(cleanAction);
-      });
-    }, SYNC_INTERVAL);
-    return () => clearInterval(actionQueueRef.current);
-  }, [role, sessionId, state.phase]);
-
-  // ── NON-DIRECTORS: sync state FROM localStorage ──
-  useEffect(() => {
-    if (role === 'director' || !role) return;
-    const doSync = () => {
-      try {
-        const raw = localStorage.getItem(`${STORAGE_KEY}-${sessionId}`);
-        if (!raw) return;
-        const p = JSON.parse(raw);
-        if (p.version > stateRef.current.version) {
-          dispatch({ type: 'SET_STATE', state: p });
-          // Re-register if the Director hasn't processed our ADD_OPERATOR yet
-          if (role === 'operator' && !p.operators[playerId]) {
-            queueAction(sessionId, { type: 'ADD_OPERATOR', id: playerId, name: playerName, stage: null, isBot: false });
-          }
-        }
-      } catch {}
-    };
-    // Immediate first sync (don't wait 500ms)
-    doSync();
-    syncRef.current = setInterval(doSync, SYNC_INTERVAL);
-    return () => clearInterval(syncRef.current);
-  }, [role, sessionId, playerId, playerName]);
+  }, [state, role]);
 
   // ── TICK TIMER ──
   useEffect(() => {
@@ -1834,73 +1837,59 @@ export default function App() {
     return () => clearInterval(intervalRef.current);
   }, [state.phase, state.startTime]);
 
-  // ── REMOTE DISPATCH: operators use this to queue actions for Director ──
+  // ── REMOTE DISPATCH: operators send actions to Director via WebSocket ──
   const remoteDispatch = useCallback((action) => {
-    dispatch(action);
-    queueAction(sessionId, action);
-  }, [sessionId]);
+    dispatch(action); // Optimistic local update
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'action', action }));
+    }
+  }, []);
 
   const handleJoin = useCallback((name, selectedRole, room) => {
     setPlayerName(name);
     setRole(selectedRole);
     setRoomCode(room);
-    const sid = room;
 
     // Update URL to include room code
     const url = new URL(window.location);
     url.searchParams.set('room', room);
     window.history.replaceState({}, '', url);
 
-    // Load existing session state
-    let existingState = null;
-    try {
-      const raw = localStorage.getItem(`${STORAGE_KEY}-${sid}`);
-      if (raw) {
-        const p = JSON.parse(raw);
-        // Ignore stale sessions (older than 2 hours)
-        if ((p.phase === 'running' || p.phase === 'staging') && p._sessionStart && Date.now() - p._sessionStart < STALE_THRESHOLD) {
-          existingState = p;
-        }
-      }
-    } catch {}
-
     if (selectedRole === 'operator') {
+      // Operator registers — server will send current state on WS connect
+      // Also dispatch ADD_OPERATOR as a remote action so Director picks it up
       const addAction = { type: 'ADD_OPERATOR', id: playerId, name, stage: null, isBot: false };
-      if (existingState) {
-        dispatch({ type: 'SET_STATE', state: existingState });
-      }
       dispatch(addAction);
-      queueAction(sid, addAction);
+      // WebSocket connect effect will fire (role changed) — send action after connect
+      setTimeout(() => {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'action', action: addAction }));
+        }
+      }, 600);
       return;
     }
 
     if (selectedRole === 'observer') {
-      if (existingState) {
-        dispatch({ type: 'SET_STATE', state: existingState });
-      }
+      // Observer — server will send current state on WS connect
       return;
     }
 
     if (selectedRole === 'director') {
-      // Clean slate for this room
-      localStorage.removeItem(`${STORAGE_KEY}-${sid}`);
-      localStorage.setItem(`${STORAGE_ACTIONS_KEY}-${sid}`, '[]');
       dispatch({ type: 'SET_STATE', state: createInitialState(room) });
       dispatch({ type: 'START_STAGING' });
     }
   }, [playerId]);
 
   const handleRestart = useCallback(() => {
-    localStorage.removeItem(`${STORAGE_KEY}-${sessionId}`);
-    localStorage.removeItem(`${STORAGE_ACTIONS_KEY}-${sessionId}`);
     dispatch({ type: 'SET_STATE', state: createInitialState() });
     setRole(null); setPlayerName('');
-    // Remove room from URL
     const url = new URL(window.location);
     url.searchParams.delete('room');
     window.history.replaceState({}, '', url);
     setRoomCode(null);
-  }, [sessionId]);
+  }, []);
 
   if (!role) return <Lobby onJoin={handleJoin} urlRoom={getRoomFromURL()} />;
   if (state.phase === 'finished') return <DebriefScreen state={state} onRestart={handleRestart} />;
