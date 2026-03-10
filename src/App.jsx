@@ -62,7 +62,7 @@ function getActiveSessions() {
       const raw = localStorage.getItem(key);
       if (!raw) continue;
       const state = JSON.parse(raw);
-      if (state.phase !== 'running') continue;
+      if (state.phase !== 'running' && state.phase !== 'staging') continue;
       if (state._sessionStart && Date.now() - state._sessionStart > STALE_THRESHOLD) continue;
       const opCount = Object.keys(state.operators || {}).length;
       sessions.push({ room, round: state.round, opCount, elapsed: state.elapsedTime });
@@ -124,7 +124,7 @@ function createInitialState(roomCode) {
     operators: {}, stageAssignments: { warehouse: [], assembly: [], oven: [], qa: [], logistics: [] },
     revenue: 0, penalties: 0, ovenBatches: [], orderLeadTimes: [],
     stageIdleTime: { warehouse: 0, assembly: 0, oven: 0, qa: 0, logistics: 0 },
-    alerts: [], lastOrderTime: 0, botTimers: { warehouse: 0, assembly: 0, oven: 0, logistics: 0 }, version: 0,
+    alerts: [], lastOrderTime: 0, botTimers: { warehouse: 0, assembly: 0, oven: 0, logistics: 0 }, strategicChangesUsed: 0, maxStrategicChanges: 3, version: 0,
   };
 }
 
@@ -288,20 +288,26 @@ function gameReducer(state, action) {
       return s;
     }
 
+    case 'START_STAGING': {
+      return { ...state, phase: 'staging', _sessionStart: Date.now(), strategicChangesUsed: 0, version: state.version + 1 };
+    }
     case 'START_SIMULATION': {
       const first = generateOrder(1, 0);
-      return { ...state, phase: 'running', startTime: Date.now(), _sessionStart: Date.now(), round: 1, orders: [first], alerts: [{ id: genId(), msg: `Simulation started! First order: ${first.chipType}×${first.quantity}`, time: 0, type: 'order' }] };
+      return { ...state, phase: 'running', startTime: Date.now(), _sessionStart: state._sessionStart || Date.now(), round: 1, orders: [first], alerts: [{ id: genId(), msg: `Simulation started! First order: ${first.chipType}×${first.quantity}`, time: 0, type: 'order' }], version: state.version + 1 };
     }
 
     case 'ASSIGN_OPERATOR': {
       const { operatorId, fromStage, toStage } = action;
+      // During running phase, reassigning (fromStage → toStage) costs a strategic change
+      const isReassign = state.phase === 'running' && fromStage;
+      if (isReassign && state.strategicChangesUsed >= state.maxStrategicChanges) return state;
       const na = { ...state.stageAssignments };
       if (fromStage) na[fromStage] = na[fromStage].filter(id => id !== operatorId);
       if (toStage && !na[toStage].includes(operatorId)) {
         const si = STAGES.find(s => s.id === toStage);
         if (na[toStage].length < si.maxOps) na[toStage] = [...na[toStage], operatorId];
       }
-      return { ...state, stageAssignments: na, version: state.version + 1 };
+      return { ...state, stageAssignments: na, strategicChangesUsed: state.strategicChangesUsed + (isReassign ? 1 : 0), version: state.version + 1 };
     }
 
     case 'KIT_CHIPS': {
@@ -354,7 +360,8 @@ function gameReducer(state, action) {
 
     case 'BUY_SECOND_OVEN': {
       if (state.hasSecondOven || state.elapsedTime < 180) return state;
-      return { ...state, hasSecondOven: true, ovenPurchaseTime: state.elapsedTime, ovens: [...state.ovens, { id: 'oven2', batch: [], running: false, startedAt: null, completesAt: null, weldTime: 0 }], alerts: [...state.alerts, { id: genId(), msg: '2nd Oven purchased! -$2,000', time: state.elapsedTime, type: 'warning' }].slice(-10), version: state.version + 1 };
+      if (state.strategicChangesUsed >= state.maxStrategicChanges) return state;
+      return { ...state, hasSecondOven: true, ovenPurchaseTime: state.elapsedTime, ovens: [...state.ovens, { id: 'oven2', batch: [], running: false, startedAt: null, completesAt: null, weldTime: 0 }], alerts: [...state.alerts, { id: genId(), msg: '2nd Oven purchased! -$2,000 (1 strategic change used)', time: state.elapsedTime, type: 'warning' }].slice(-10), strategicChangesUsed: state.strategicChangesUsed + 1, version: state.version + 1 };
     }
 
     case 'SHIP_ORDER': {
@@ -525,6 +532,8 @@ function OperatorAssignment({ state, dispatch }) {
   const humanOps = allOps.filter(([, op]) => !op.isBot);
   const botOps = allOps.filter(([, op]) => op.isBot);
   const emptyStages = STAGES.filter(s => state.stageAssignments[s.id].length === 0);
+  const changesLeft = state.maxStrategicChanges - state.strategicChangesUsed;
+  const noChanges = changesLeft <= 0;
 
   return (
     <div className={`bg-[#161B22] border rounded-xl p-4 transition-all ${unassigned.length > 0 ? 'border-[#F0B429] ring-1 ring-[#F0B429]/20' : 'border-[#30363D]'}`}>
@@ -553,6 +562,13 @@ function OperatorAssignment({ state, dispatch }) {
         </div>
       </div>
 
+      {/* No changes warning */}
+      {noChanges && assigned.length > 0 && (
+        <div className="bg-[#F85149]/10 border border-[#F85149]/30 rounded-lg px-3 py-2 mb-3">
+          <p className="text-[10px] text-[#F85149] font-bold">No strategic changes remaining — team allocation is locked</p>
+        </div>
+      )}
+
       {allOps.length === 0 ? (
         /* Empty state */
         <div className="py-3">
@@ -566,7 +582,7 @@ function OperatorAssignment({ state, dispatch }) {
               dispatch({ type: 'ADD_OPERATOR', id: genId(), name, stage: ['warehouse','assembly','oven','qa','logistics'][i], isBot: true });
             });
           }} className="w-full py-2.5 text-xs font-bold bg-cyan/15 text-cyan border border-cyan/30 rounded-lg hover:bg-cyan/25 transition-all active:scale-[0.98]">
-            🤖 Solo Mode — Add Bot Operators
+            Solo Mode — Add Bot Operators
           </button>
           <p className="text-[8px] text-[#30363D] text-center mt-1.5">Bots auto-process each stage at fixed intervals</p>
         </div>
@@ -614,7 +630,8 @@ function OperatorAssignment({ state, dispatch }) {
                     <span className="text-[#8B949E] w-20 truncate">{op.name}</span>
                     <span className="text-[10px] text-[#21262D]">→</span>
                     <select value={cs || ''} onChange={e => move(id, e.target.value || null)}
-                      className="bg-[#0D1117] border border-[#30363D] rounded px-2 py-0.5 text-[10px] text-white flex-1 min-w-0 focus:border-[#F0B429] focus:outline-none transition-colors">
+                      disabled={noChanges}
+                      className={`bg-[#0D1117] border border-[#30363D] rounded px-2 py-0.5 text-[10px] text-white flex-1 min-w-0 focus:border-[#F0B429] focus:outline-none transition-colors ${noChanges ? 'opacity-50 cursor-not-allowed' : ''}`}>
                       <option value="">Unassign</option>
                       {STAGES.map(s => <option key={s.id} value={s.id} disabled={state.stageAssignments[s.id].length >= s.maxOps && s.id !== cs}>{s.icon} {s.name} ({state.stageAssignments[s.id].length}/{s.maxOps})</option>)}
                     </select>
@@ -636,6 +653,96 @@ function OperatorAssignment({ state, dispatch }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── STRATEGY BRIEFING (used in staging phase) ─────────────────────────────
+function StrategyBriefing() {
+  return (
+    <div className="space-y-3">
+      {/* Pipeline Flow */}
+      <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-4">
+        <h3 className="text-xs font-bold text-white mb-3 uppercase tracking-wider">Production Pipeline</h3>
+        <div className="flex items-center gap-1 text-[10px] overflow-x-auto pb-1">
+          {STAGES.map((s, i) => (
+            <div key={s.id} className="flex items-center gap-1 shrink-0">
+              {i > 0 && <span className="text-[#30363D]">→</span>}
+              <div className="bg-[#0D1117] border border-[#21262D] rounded-lg px-2.5 py-1.5 text-center">
+                <div className="text-sm leading-none mb-0.5">{s.icon}</div>
+                <div className="text-[9px] font-bold text-white">{s.shortName}</div>
+                <div className="text-[8px] text-[#8B949E]">max {s.maxOps}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Chip Values & Times */}
+      <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-4">
+        <h3 className="text-xs font-bold text-white mb-3 uppercase tracking-wider">Chip Types</h3>
+        <div className="space-y-2">
+          {Object.values(CHIP_TYPES).map(chip => (
+            <div key={chip.name} className="flex items-center gap-3 bg-[#0D1117] border border-[#21262D] rounded-lg px-3 py-2">
+              <div className="shrink-0">
+                <ChipIcon chipType={chip.name} size={20} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-white">{chip.name}</span>
+                  <span className="text-[9px] text-[#8B949E]">{chip.label}</span>
+                </div>
+                <div className="flex gap-3 mt-0.5 text-[9px] text-[#8B949E]">
+                  <span>{chip.pieces} pcs</span>
+                  <span>Build {chip.assemblyTime}s</span>
+                  <span>Oven {chip.ovenTime}s</span>
+                </div>
+              </div>
+              <div className="text-right shrink-0">
+                <span className="text-xs font-bold text-[#3FB950]">${chip.value}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Key Constraints */}
+      <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-4">
+        <h3 className="text-xs font-bold text-white mb-3 uppercase tracking-wider">Key Constraints</h3>
+        <div className="grid grid-cols-2 gap-2 text-[10px]">
+          <div className="bg-[#0D1117] border border-[#21262D] rounded-lg p-2">
+            <div className="text-[#F0B429] font-bold mb-0.5">🔥 Oven</div>
+            <div className="text-[#8B949E]">8 chips per batch</div>
+            <div className="text-[#8B949E]">2nd oven: $2,000 @ 3min</div>
+          </div>
+          <div className="bg-[#0D1117] border border-[#21262D] rounded-lg p-2">
+            <div className="text-[#F0B429] font-bold mb-0.5">⏰ Orders</div>
+            <div className="text-[#8B949E]">Standard: 3min expiry</div>
+            <div className="text-[#8B949E]">Express: 90s (1.5x pay)</div>
+          </div>
+          <div className="bg-[#0D1117] border border-[#21262D] rounded-lg p-2">
+            <div className="text-[#F0B429] font-bold mb-0.5">⚠️ Penalties</div>
+            <div className="text-[#8B949E]">$50 per expired order</div>
+          </div>
+          <div className="bg-[#0D1117] border border-[#21262D] rounded-lg p-2">
+            <div className="text-[#F0B429] font-bold mb-0.5">🔧 Changes</div>
+            <div className="text-[#8B949E]">3 strategic changes max</div>
+            <div className="text-[#8B949E]">during simulation</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Strategy Tips */}
+      <div className="bg-[#F0B429]/5 border border-[#F0B429]/20 rounded-xl p-4">
+        <h3 className="text-xs font-bold text-[#F0B429] mb-2 uppercase tracking-wider">Strategy Tips</h3>
+        <ul className="space-y-1.5 text-[10px] text-[#C9D1D9]">
+          <li className="flex gap-2"><span className="text-[#F0B429] shrink-0">1.</span>Assembly is the bottleneck — max 3 operators, longest build times</li>
+          <li className="flex gap-2"><span className="text-[#F0B429] shrink-0">2.</span>Full oven batches (8 chips) = best efficiency, don't fire half-empty</li>
+          <li className="flex gap-2"><span className="text-[#F0B429] shrink-0">3.</span>EXPRESS orders pay 1.5x but expire in 90s — prioritize or ignore?</li>
+          <li className="flex gap-2"><span className="text-[#F0B429] shrink-0">4.</span>QA needs only 1 operator but processes 5s per chip — can bottleneck late</li>
+          <li className="flex gap-2"><span className="text-[#F0B429] shrink-0">5.</span>Plan your 3 changes wisely — save one for emergencies</li>
+        </ul>
+      </div>
     </div>
   );
 }
@@ -1001,7 +1108,9 @@ function InteractiveOven({ state, dispatch }) {
         </div>
       </div>
       {!state.hasSecondOven && state.elapsedTime >= 180 && (
-        <button onClick={() => dispatch({ type: 'BUY_SECOND_OVEN' })} className="w-full py-2 text-xs font-bold bg-[#F85149]/20 text-[#F85149] border border-[#F85149]/40 rounded hover:bg-[#F85149]/30 transition-colors">Buy 2nd Oven (-$2,000)</button>
+        state.strategicChangesUsed >= state.maxStrategicChanges
+          ? <p className="text-[10px] text-[#F85149] text-center">No strategic changes remaining</p>
+          : <button onClick={() => dispatch({ type: 'BUY_SECOND_OVEN' })} className="w-full py-2 text-xs font-bold bg-[#F85149]/20 text-[#F85149] border border-[#F85149]/40 rounded hover:bg-[#F85149]/30 transition-colors cursor-pointer">Buy 2nd Oven (-$2,000) — uses 1 change</button>
       )}
       {!state.hasSecondOven && state.elapsedTime < 180 && <p className="text-[10px] text-[#8B949E] text-center">2nd oven available after Round 3</p>}
     </div>
@@ -1129,6 +1238,17 @@ function DirectorView({ state, dispatch, roomCode }) {
               <span className="text-[10px] font-mono text-[#8B949E]">{totalOps} ops</span>
               {humanOps > 0 && <span className="text-[10px] text-[#3FB950]">({humanOps} human)</span>}
             </div>
+            {/* Strategic changes remaining */}
+            <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border ${
+              state.strategicChangesUsed >= state.maxStrategicChanges
+                ? 'bg-[#F85149]/10 border-[#F85149]/30'
+                : 'bg-[#0D1117] border-[#21262D]'
+            }`}>
+              <span className="text-[10px] font-mono text-[#8B949E]">Changes</span>
+              <span className={`text-[10px] font-bold font-mono ${
+                state.strategicChangesUsed >= state.maxStrategicChanges ? 'text-[#F85149]' : 'text-[#F0B429]'
+              }`}>{state.maxStrategicChanges - state.strategicChangesUsed}/{state.maxStrategicChanges}</span>
+            </div>
             <div className="text-right"><div className="text-[10px] text-[#8B949E] uppercase">Net Score</div><div className={`text-lg font-mono font-bold ${netScore >= 0 ? 'text-[#3FB950]' : 'text-[#F85149]'}`}>${netScore.toLocaleString()}</div></div>
             <div className="text-right"><div className="text-[10px] text-[#8B949E] uppercase">Throughput</div><div className="text-lg font-mono font-bold text-cyan">{throughput}/min</div></div>
             <div className="text-right"><div className="text-[10px] text-[#8B949E] uppercase">Revenue</div><div className="text-sm font-mono text-[#3FB950]">+${state.revenue.toLocaleString()}</div></div>
@@ -1228,7 +1348,9 @@ function DirectorView({ state, dispatch, roomCode }) {
               </div>
               <div className="text-[10px] text-[#8B949E] mt-2">{state.ovenQueue.length} chips waiting</div>
               {!state.hasSecondOven && state.elapsedTime >= 180 && (
-                <button onClick={() => dispatch({ type: 'BUY_SECOND_OVEN' })} className="mt-2 w-full py-1.5 text-[10px] font-bold bg-[#F85149]/20 text-[#F85149] border border-[#F85149]/40 rounded hover:bg-[#F85149]/30 transition-colors">Buy 2nd Oven (-$2,000)</button>
+                state.strategicChangesUsed >= state.maxStrategicChanges
+                  ? <p className="mt-2 text-[10px] text-[#F85149] text-center">No changes left</p>
+                  : <button onClick={() => dispatch({ type: 'BUY_SECOND_OVEN' })} className="mt-2 w-full py-1.5 text-[10px] font-bold bg-[#F85149]/20 text-[#F85149] border border-[#F85149]/40 rounded hover:bg-[#F85149]/30 transition-colors cursor-pointer">Buy 2nd Oven — 1 change</button>
               )}
             </div>
 
@@ -1653,18 +1775,22 @@ export default function App() {
   const [playerId] = useState(genId);
   const intervalRef = useRef(null);
   const syncRef = useRef(null);
+  const stateRef = useRef(state);
+
+  // Keep stateRef in sync for use in interval callbacks (avoids stale closures)
+  useEffect(() => { stateRef.current = state; }, [state]);
 
   // ── DIRECTOR: write game state to localStorage (single source of truth) ──
   useEffect(() => {
     if (role !== 'director') return;
     if (state.phase === 'lobby') return;
     try { localStorage.setItem(`${STORAGE_KEY}-${sessionId}`, JSON.stringify(state)); } catch {}
-  }, [state.version, state.phase, role, sessionId]);
+  }, [state, role, sessionId]);
 
   // ── DIRECTOR: poll action queue from operators ──
   const actionQueueRef = useRef(null);
   useEffect(() => {
-    if (role !== 'director' || state.phase !== 'running') {
+    if (role !== 'director' || (state.phase !== 'running' && state.phase !== 'staging')) {
       clearInterval(actionQueueRef.current);
       return;
     }
@@ -1681,12 +1807,12 @@ export default function App() {
   // ── NON-DIRECTORS: sync state FROM localStorage ──
   useEffect(() => {
     if (role === 'director' || !role) return;
-    syncRef.current = setInterval(() => {
+    const doSync = () => {
       try {
         const raw = localStorage.getItem(`${STORAGE_KEY}-${sessionId}`);
         if (!raw) return;
         const p = JSON.parse(raw);
-        if (p.version > state.version) {
+        if (p.version > stateRef.current.version) {
           dispatch({ type: 'SET_STATE', state: p });
           // Re-register if the Director hasn't processed our ADD_OPERATOR yet
           if (role === 'operator' && !p.operators[playerId]) {
@@ -1694,9 +1820,12 @@ export default function App() {
           }
         }
       } catch {}
-    }, SYNC_INTERVAL);
+    };
+    // Immediate first sync (don't wait 500ms)
+    doSync();
+    syncRef.current = setInterval(doSync, SYNC_INTERVAL);
     return () => clearInterval(syncRef.current);
-  }, [role, sessionId, state.version, playerId, playerName]);
+  }, [role, sessionId, playerId, playerName]);
 
   // ── TICK TIMER ──
   useEffect(() => {
@@ -1729,7 +1858,7 @@ export default function App() {
       if (raw) {
         const p = JSON.parse(raw);
         // Ignore stale sessions (older than 2 hours)
-        if (p.phase === 'running' && p._sessionStart && Date.now() - p._sessionStart < STALE_THRESHOLD) {
+        if ((p.phase === 'running' || p.phase === 'staging') && p._sessionStart && Date.now() - p._sessionStart < STALE_THRESHOLD) {
           existingState = p;
         }
       }
@@ -1757,7 +1886,7 @@ export default function App() {
       localStorage.removeItem(`${STORAGE_KEY}-${sid}`);
       localStorage.setItem(`${STORAGE_ACTIONS_KEY}-${sid}`, '[]');
       dispatch({ type: 'SET_STATE', state: createInitialState(room) });
-      dispatch({ type: 'START_SIMULATION' });
+      dispatch({ type: 'START_STAGING' });
     }
   }, [playerId]);
 
@@ -1789,6 +1918,258 @@ export default function App() {
       </div>
     </div>
   );
+
+  // ── STAGING PHASE: Director plans strategy, operators see briefing ──
+  if (state.phase === 'staging') {
+    const ops = Object.entries(state.operators || {});
+    const shareUrl = `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
+    const getStage = (id) => { for (const [s, ids] of Object.entries(state.stageAssignments)) if (ids.includes(id)) return s; return null; };
+    const unassigned = ops.filter(([id]) => !getStage(id));
+    const allAssigned = ops.length > 0 && unassigned.length === 0;
+
+    if (role === 'director') {
+      return (
+        <div className="min-h-screen bg-[#0D1117] text-white p-4">
+          <div className="max-w-2xl mx-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h1 className="text-xl font-black text-[#F0B429] tracking-tight">STRATEGY PLANNING</h1>
+                <p className="text-[10px] text-[#8B949E] mt-0.5">Assign your team and review the briefing before starting</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="bg-[#161B22] border border-[#F0B429]/30 rounded-lg px-3 py-1.5 text-center">
+                  <p className="text-[8px] text-[#8B949E] uppercase font-bold">Room</p>
+                  <p className="text-lg font-mono font-black text-[#F0B429] tracking-wider leading-tight">{roomCode}</p>
+                </div>
+                <button
+                  onClick={() => { navigator.clipboard.writeText(shareUrl); }}
+                  className="text-[10px] text-[#58A6FF] hover:text-[#79C0FF] transition-colors cursor-pointer bg-[#161B22] border border-[#30363D] rounded-lg px-2 py-1"
+                >
+                  Copy link
+                </button>
+              </div>
+            </div>
+
+            {/* Worker Allocation Board */}
+            <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-4 mb-3">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">Factory Blueprint — Worker Allocation</h3>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-[#8B949E]">{ops.length} operator{ops.length !== 1 ? 's' : ''}</span>
+                  {allAssigned && <span className="text-[9px] font-bold text-[#3FB950] bg-[#3FB950]/10 px-1.5 py-0.5 rounded-full">All assigned</span>}
+                </div>
+              </div>
+
+              {/* Stage columns */}
+              <div className="grid grid-cols-5 gap-2 mb-3">
+                {STAGES.map(s => {
+                  const stageOps = ops.filter(([id]) => getStage(id) === s.id);
+                  const count = stageOps.length;
+                  return (
+                    <div key={s.id} className={`bg-[#0D1117] border rounded-lg p-2 text-center transition-all ${count > 0 ? 'border-[#30363D]' : 'border-dashed border-[#21262D]'}`}>
+                      <div className="text-lg leading-none mb-1">{s.icon}</div>
+                      <div className="text-[9px] font-bold text-white">{s.shortName}</div>
+                      <div className={`text-[8px] font-mono ${count >= s.maxOps ? 'text-[#F0B429]' : 'text-[#8B949E]'}`}>{count}/{s.maxOps}</div>
+                      {stageOps.length > 0 && (
+                        <div className="mt-1.5 space-y-1">
+                          {stageOps.map(([id, op]) => (
+                            <div key={id} className="text-[8px] bg-[#161B22] rounded px-1 py-0.5 truncate flex items-center gap-1">
+                              <span>{op.isBot ? '🤖' : '👷'}</span>
+                              <span className="text-[#C9D1D9] truncate">{op.name.length > 6 ? op.name.slice(0, 6) + '..' : op.name}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Unassigned operators */}
+              {ops.length === 0 ? (
+                <div className="text-center py-4">
+                  <p className="text-sm text-[#8B949E] mb-2">Waiting for operators to join...</p>
+                  <div className="flex justify-center gap-1 mb-3">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '0ms' }} />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '150ms' }} />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '300ms' }} />
+                  </div>
+                  <button onClick={() => {
+                    ['Bot-WH','Bot-ASM','Bot-OVN','Bot-QA','Bot-LOG'].forEach((name, i) => {
+                      dispatch({ type: 'ADD_OPERATOR', id: genId(), name, stage: ['warehouse','assembly','oven','qa','logistics'][i], isBot: true });
+                    });
+                  }} className="py-2 px-4 text-xs font-bold bg-cyan/15 text-cyan border border-cyan/30 rounded-lg hover:bg-cyan/25 transition-all active:scale-[0.98] cursor-pointer">
+                    Solo Mode — Add 5 Bot Operators
+                  </button>
+                </div>
+              ) : unassigned.length > 0 ? (
+                <div className="space-y-2">
+                  {unassigned.map(([id, op]) => (
+                    <div key={id} className="bg-[#F0B429]/5 border border-[#F0B429]/30 rounded-lg p-2.5">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className={`w-2 h-2 rounded-full shrink-0 ${op.isBot ? 'bg-cyan' : 'bg-[#3FB950]'}`} />
+                        <span className="text-xs font-bold text-white">{op.name}</span>
+                        <span className={`text-[8px] px-1.5 py-0.5 rounded-full font-bold ${op.isBot ? 'bg-cyan/15 text-cyan' : 'bg-[#3FB950]/15 text-[#3FB950]'}`}>
+                          {op.isBot ? 'BOT' : 'HUMAN'}
+                        </span>
+                        <span className="text-[9px] text-[#F0B429] ml-auto">Assign →</span>
+                      </div>
+                      <div className="grid grid-cols-5 gap-1">
+                        {STAGES.map(s => {
+                          const count = state.stageAssignments[s.id].length;
+                          const full = count >= s.maxOps;
+                          return (
+                            <button key={s.id} onClick={() => dispatch({ type: 'ASSIGN_OPERATOR', operatorId: id, fromStage: null, toStage: s.id })} disabled={full}
+                              className={`py-1.5 px-1 rounded text-center transition-all cursor-pointer ${full
+                                ? 'bg-[#21262D] text-[#30363D] cursor-not-allowed'
+                                : 'bg-[#0D1117] text-[#8B949E] border border-[#30363D] hover:border-[#F0B429] hover:text-[#F0B429] active:scale-95'
+                              }`}>
+                              <div className="text-xs leading-none">{s.icon}</div>
+                              <div className="text-[7px] font-bold mt-0.5">{s.shortName}</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between bg-[#3FB950]/5 border border-[#3FB950]/20 rounded-lg px-3 py-2">
+                  <span className="text-xs text-[#3FB950] font-medium">All operators assigned — ready to start!</span>
+                  <button onClick={() => {
+                    // Allow adding more bots to empty slots
+                    const empty = STAGES.filter(s => state.stageAssignments[s.id].length === 0);
+                    empty.forEach(s => dispatch({ type: 'ADD_OPERATOR', id: genId(), name: `Bot-${s.shortName}`, stage: s.id, isBot: true }));
+                  }} className={`text-[9px] text-cyan/60 hover:text-cyan transition-colors cursor-pointer ${STAGES.every(s => state.stageAssignments[s.id].length > 0) ? 'hidden' : ''}`}>
+                    + Fill empty with bots
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Strategy Briefing (collapsible) */}
+            <details className="mb-3 group">
+              <summary className="bg-[#161B22] border border-[#30363D] rounded-xl px-4 py-3 cursor-pointer text-xs font-bold text-white uppercase tracking-wider flex items-center justify-between hover:border-[#F0B429]/30 transition-colors list-none">
+                <span>Strategy Briefing</span>
+                <span className="text-[#8B949E] text-[10px] font-normal normal-case group-open:hidden">Click to expand</span>
+                <span className="text-[#8B949E] text-[10px] font-normal normal-case hidden group-open:inline">Click to collapse</span>
+              </summary>
+              <div className="mt-2">
+                <StrategyBriefing />
+              </div>
+            </details>
+
+            {/* Start Button */}
+            <button
+              onClick={() => dispatch({ type: 'START_SIMULATION' })}
+              disabled={ops.length === 0}
+              className={`w-full py-4 rounded-xl text-lg font-black tracking-wide transition-all cursor-pointer ${
+                allAssigned
+                  ? 'bg-[#3FB950] text-white hover:bg-[#4AE35B] active:scale-[0.98] shadow-lg shadow-[#3FB950]/20'
+                  : ops.length > 0
+                    ? 'bg-[#3FB950]/70 text-white/90 hover:bg-[#3FB950]/80 active:scale-[0.98]'
+                    : 'bg-[#21262D] text-[#30363D] cursor-not-allowed'
+              }`}
+            >
+              {ops.length === 0
+                ? 'Waiting for operators...'
+                : allAssigned
+                  ? `Start Simulation (${ops.length} ready, ${state.maxStrategicChanges} changes)`
+                  : `Start Simulation (${unassigned.length} unassigned)`
+              }
+            </button>
+            {ops.length > 0 && !allAssigned && (
+              <p className="text-[10px] text-[#F0B429] text-center mt-1.5">Assign all operators to stages before starting</p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // Operator/Observer staging — see briefing + their assignment
+    const myStage = getStage(playerId);
+    const myStageInfo = myStage ? STAGES.find(s => s.id === myStage) : null;
+    return (
+      <div className="min-h-screen bg-[#0D1117] text-white p-4">
+        <div className="max-w-md mx-auto">
+          {/* Header */}
+          <div className="text-center mb-4">
+            <div className="text-4xl mb-2">🏭</div>
+            <h2 className="text-xl font-bold text-[#F0B429] mb-1">You're In!</h2>
+            <p className="text-sm text-[#8B949E]">Review the briefing while the Director plans the strategy</p>
+            <div className="mt-2 inline-flex items-center gap-2 bg-[#161B22] border border-[#30363D] rounded-lg px-3 py-1.5">
+              <span className="text-[9px] text-[#8B949E] uppercase font-bold">Room</span>
+              <span className="text-base font-mono font-bold text-[#F0B429] tracking-wider">{roomCode}</span>
+            </div>
+          </div>
+
+          {/* My Assignment */}
+          {myStageInfo ? (
+            <div className="bg-[#3FB950]/10 border border-[#3FB950]/30 rounded-xl p-4 mb-3 text-center">
+              <p className="text-[10px] text-[#8B949E] uppercase font-bold mb-1">Your Assignment</p>
+              <div className="text-3xl mb-1">{myStageInfo.icon}</div>
+              <p className="text-lg font-bold text-white">{myStageInfo.name}</p>
+            </div>
+          ) : (
+            <div className="bg-[#F0B429]/10 border border-[#F0B429]/30 rounded-xl p-4 mb-3 text-center">
+              <p className="text-sm text-[#F0B429]">Waiting for Director to assign you to a stage...</p>
+              <div className="flex justify-center gap-1 mt-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+            </div>
+          )}
+
+          {/* Team Overview */}
+          <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-3 mb-3">
+            <h3 className="text-[10px] font-bold text-white uppercase tracking-wider mb-2">Team</h3>
+            <div className="grid grid-cols-5 gap-1.5 mb-2">
+              {STAGES.map(s => {
+                const stageOps = ops.filter(([id]) => getStage(id) === s.id);
+                return (
+                  <div key={s.id} className="text-center">
+                    <div className="text-sm">{s.icon}</div>
+                    <div className="text-[8px] text-[#8B949E]">{s.shortName}</div>
+                    <div className="text-[8px] font-mono text-[#8B949E]">{stageOps.length}/{s.maxOps}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="space-y-1">
+              {ops.map(([id, op]) => {
+                const stage = getStage(id);
+                const si = stage ? STAGES.find(s => s.id === stage) : null;
+                return (
+                  <div key={id} className={`flex items-center gap-2 text-[10px] px-2 py-1 rounded ${id === playerId ? 'bg-[#F0B429]/10 text-[#F0B429] font-bold' : 'text-[#C9D1D9]'}`}>
+                    <span>{op.isBot ? '🤖' : '👷'}</span>
+                    <span className="flex-1 truncate">{op.name}{id === playerId ? ' (you)' : ''}</span>
+                    {si ? <span className="text-[#8B949E]">{si.icon} {si.shortName}</span> : <span className="text-[#30363D]">—</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Strategy Briefing */}
+          <details className="mb-3 group" open>
+            <summary className="bg-[#161B22] border border-[#30363D] rounded-xl px-4 py-3 cursor-pointer text-xs font-bold text-white uppercase tracking-wider flex items-center justify-between hover:border-[#F0B429]/30 transition-colors list-none">
+              <span>Strategy Briefing</span>
+              <span className="text-[#8B949E] text-[10px] font-normal normal-case group-open:hidden">Click to expand</span>
+              <span className="text-[#8B949E] text-[10px] font-normal normal-case hidden group-open:inline">Click to collapse</span>
+            </summary>
+            <div className="mt-2">
+              <StrategyBriefing />
+            </div>
+          </details>
+
+          <div className="text-center text-xs text-[#30363D] font-mono">{playerName} • {role}</div>
+        </div>
+      </div>
+    );
+  }
+
   switch (role) {
     case 'director': return <DirectorView state={state} dispatch={dispatch} roomCode={roomCode} />;
     case 'operator': return <OperatorView state={state} dispatch={remoteDispatch} operatorId={playerId} operatorName={playerName} />;
