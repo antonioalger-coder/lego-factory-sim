@@ -47,11 +47,22 @@ const generateRoomCode = () => Array.from({ length: 4 }, () => ROOM_CHARS[Math.f
 const getRoomFromURL = () => new URLSearchParams(window.location.search).get('room')?.toUpperCase() || null;
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
 
-function generateOrder(roundNumber, simTime) {
-  const types = ['ALPHA','BETA','GAMMA'];
+function weightedChipType(weights) {
+  const entries = Object.entries(weights);
+  const total = entries.reduce((s, [, w]) => s + w, 0);
+  if (total <= 0) return 'ALPHA';
+  let r = Math.random() * total;
+  for (const [type, w] of entries) {
+    r -= w;
+    if (r <= 0) return type;
+  }
+  return entries[entries.length - 1][0];
+}
+
+function generateOrder(roundNumber, simTime, chipWeights) {
   const quantities = [2,4,6,8];
   const urgencies = ['STANDARD','EXPRESS','BULK'];
-  const chipType = types[Math.floor(Math.random()*types.length)];
+  const chipType = chipWeights ? weightedChipType(chipWeights) : ['ALPHA','BETA','GAMMA'][Math.floor(Math.random()*3)];
   const quantity = quantities[Math.floor(Math.random()*quantities.length)];
   const urgency = urgencies[Math.floor(Math.random()*urgencies.length)];
   const urgInfo = URGENCY_TYPES[urgency];
@@ -70,7 +81,7 @@ function canKitOrder(order, stock) {
 function createInitialState(roomCode) {
   return {
     sessionId: roomCode || 'default', phase: 'lobby', startTime: null, elapsedTime: 0, round: 0, _sessionStart: null,
-    stock: { ...INITIAL_STOCK }, orders: [],
+    stock: { ...INITIAL_STOCK }, stockMultiplier: 1.0, holdingCostRate: 0, holdingCostAccrued: 0, chipWeights: { ALPHA: 1, BETA: 1, GAMMA: 2 }, orders: [],
     warehouseQueue: [], assemblyInProgress: [], ovenQueue: [],
     ovens: [{ id: 'oven1', batch: [], running: false, startedAt: null, completesAt: null, weldTime: 0 }],
     hasSecondOven: false, ovenPurchaseTime: null,
@@ -94,7 +105,7 @@ function gameReducer(state, action) {
       // Generate orders
       const currentRound = Math.floor(now / ORDER_INTERVAL) + 1;
       if (currentRound > s.round && s.round < 10) {
-        const order = generateOrder(currentRound, now);
+        const order = generateOrder(currentRound, now, s.chipWeights);
         s = { ...s, round: currentRound, orders: [...s.orders, order], lastOrderTime: now };
         s.alerts = [...s.alerts, { id: genId(), msg: `New order #${order.orderNumber}: ${order.chipType}×${order.quantity} (${order.urgency})`, time: now, type: 'order' }].slice(-10);
       }
@@ -239,6 +250,15 @@ function gameReducer(state, action) {
         if (stage.id === 'logistics') isIdle = hasOps && s.finishedChips.length === 0;
         if (isIdle) s.stageIdleTime = { ...s.stageIdleTime, [stage.id]: s.stageIdleTime[stage.id] + 1 };
       }
+
+      // Holding cost: drain cash per tick based on total inventory
+      if (s.holdingCostRate > 0) {
+        const totalBricks = Object.values(s.stock).reduce((sum, v) => sum + v, 0);
+        const cost = totalBricks * s.holdingCostRate;
+        s.holdingCostAccrued = (s.holdingCostAccrued || 0) + cost;
+        s.penalties += cost;
+      }
+
       return s;
     }
 
@@ -340,6 +360,41 @@ function gameReducer(state, action) {
 
     case 'SEND_ALERT': {
       return { ...state, alerts: [...state.alerts, { id: genId(), msg: action.msg, time: state.elapsedTime, type: action.alertType || 'info' }].slice(-10), version: state.version + 1 };
+    }
+
+    case 'SET_GAME_CONFIG': {
+      const updates = {};
+      if (action.chipWeights !== undefined) updates.chipWeights = action.chipWeights;
+      if (action.holdingCostRate !== undefined) updates.holdingCostRate = action.holdingCostRate;
+      if (action.stockMultiplier !== undefined) {
+        updates.stockMultiplier = action.stockMultiplier;
+        const newStock = {};
+        for (const [color, base] of Object.entries(INITIAL_STOCK)) {
+          newStock[color] = Math.round(base * action.stockMultiplier);
+        }
+        updates.stock = newStock;
+      }
+      return { ...state, ...updates, version: state.version + 1 };
+    }
+
+    case 'INJECT_ORDER': {
+      if (state.phase !== 'running') return state;
+      const order = generateOrder(state.round + 0.5, state.elapsedTime, state.chipWeights);
+      if (action.chipType) { order.chipType = action.chipType; order.quantity = action.quantity || order.quantity; }
+      if (action.urgency) { order.urgency = action.urgency; order.expiresAt = state.elapsedTime + URGENCY_TYPES[action.urgency].expiry; }
+      order.value = CHIP_TYPES[order.chipType].value * order.quantity * URGENCY_TYPES[order.urgency].multiplier;
+      return { ...state, orders: [...state.orders, order], alerts: [...state.alerts, { id: genId(), msg: `TEACHER injected: ${order.chipType}×${order.quantity} (${order.urgency})`, time: state.elapsedTime, type: 'warning' }].slice(-10), version: state.version + 1 };
+    }
+
+    case 'PAUSE_SIMULATION': {
+      if (state.phase !== 'running') return state;
+      return { ...state, phase: 'paused', _pausedAt: Date.now(), version: state.version + 1 };
+    }
+
+    case 'RESUME_SIMULATION': {
+      if (state.phase !== 'paused') return state;
+      const pauseDuration = Date.now() - state._pausedAt;
+      return { ...state, phase: 'running', startTime: state.startTime + pauseDuration, _pausedAt: null, version: state.version + 1 };
     }
 
     case 'SET_STATE': return action.state;
@@ -1211,6 +1266,14 @@ function DirectorView({ state, dispatch, roomCode }) {
         </div>
       </div>
 
+      {/* Paused Banner */}
+      {state.phase === 'paused' && (
+        <div className="bg-[#F0B429]/10 border-b border-[#F0B429]/30 px-4 py-2 text-center">
+          <span className="text-sm font-bold text-[#F0B429]">SIMULATION PAUSED</span>
+          <span className="text-xs text-[#8B949E] ml-2">— Teacher has paused this session</span>
+        </div>
+      )}
+
       {/* Alerts & Operator Warnings */}
       <div className="max-w-[1400px] mx-auto px-4 mt-2 space-y-1.5">
         <AlertBanner alerts={state.alerts} />
@@ -1372,6 +1435,12 @@ function OperatorView({ state, dispatch, operatorId, operatorName }) {
         </div>
       </div>
 
+      {state.phase === 'paused' && (
+        <div className="bg-[#F0B429]/10 border-b border-[#F0B429]/30 px-4 py-2 text-center">
+          <span className="text-sm font-bold text-[#F0B429]">SIMULATION PAUSED</span>
+        </div>
+      )}
+
       <div className="max-w-2xl mx-auto px-4 py-6">
         {!assignedStage ? (
           <div className="py-6 animate-fade-in">
@@ -1495,6 +1564,420 @@ function ObserverView({ state }) {
   );
 }
 
+// ─── TEACHER VIEW ─────────────────────────────────────────────────────────────
+function TeacherRoomCard({ roomCode, state, onAction }) {
+  const netScore = state.revenue - state.penalties - (state.hasSecondOven ? SECOND_OVEN_COST : 0);
+  const remaining = SIM_DURATION - (state.elapsedTime || 0);
+  const totalOps = Object.keys(state.operators || {}).length;
+  const shipped = state.shippedChips?.length || 0;
+  const throughput = state.elapsedTime > 0 ? (shipped / (state.elapsedTime / 60)).toFixed(1) : '0.0';
+  const expired = state.orders?.filter(o => o.status === 'expired').length || 0;
+  const isRunning = state.phase === 'running';
+  const isPaused = state.phase === 'paused';
+  const isStaging = state.phase === 'staging';
+  const isFinished = state.phase === 'finished';
+
+  // Mini pipeline queue sizes
+  const qs = {
+    warehouse: state.orders?.filter(o => o.status === 'pending').length || 0,
+    assembly: state.warehouseQueue?.length || 0,
+    oven: state.ovenQueue?.length || 0,
+    qa: (state.qaQueue?.length || 0) + (state.qaInProgress?.length || 0),
+    logistics: state.finishedChips?.length || 0,
+  };
+  const maxQ = Math.max(...Object.values(qs), 1);
+
+  return (
+    <div className={`bg-[#161B22] border rounded-xl p-4 transition-all ${isRunning ? 'border-[#3FB950]/40' : isPaused ? 'border-[#F0B429]/40' : isFinished ? 'border-[#8B949E]/40' : 'border-[#30363D]'}`}>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-lg font-mono font-black text-[#F0B429] tracking-wider">{roomCode}</span>
+          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+            isRunning ? 'bg-[#3FB950]/15 text-[#3FB950]' :
+            isPaused ? 'bg-[#F0B429]/15 text-[#F0B429]' :
+            isFinished ? 'bg-[#8B949E]/15 text-[#8B949E]' :
+            'bg-[#58A6FF]/15 text-[#58A6FF]'
+          }`}>{state.phase?.toUpperCase()}</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <div className={`w-2 h-2 rounded-full ${totalOps > 0 ? 'bg-[#3FB950]' : 'bg-[#30363D]'}`} />
+          <span className="text-[10px] font-mono text-[#8B949E]">{totalOps} ops</span>
+        </div>
+      </div>
+
+      {/* KPIs row */}
+      <div className="grid grid-cols-3 gap-2 mb-3">
+        <div className="text-center">
+          <div className="text-[8px] text-[#8B949E] uppercase">Score</div>
+          <div className={`text-sm font-mono font-bold ${netScore >= 0 ? 'text-[#3FB950]' : 'text-[#F85149]'}`}>${netScore.toLocaleString()}</div>
+        </div>
+        <div className="text-center">
+          <div className="text-[8px] text-[#8B949E] uppercase">Throughput</div>
+          <div className="text-sm font-mono font-bold text-cyan">{throughput}/m</div>
+        </div>
+        <div className="text-center">
+          <div className="text-[8px] text-[#8B949E] uppercase">{isRunning || isPaused ? 'Time Left' : 'Round'}</div>
+          <div className={`text-sm font-mono font-bold ${remaining < 60 && isRunning ? 'text-[#F85149]' : 'text-white'}`}>
+            {isRunning || isPaused ? formatTime(remaining) : `${state.round || 0}/10`}
+          </div>
+        </div>
+      </div>
+
+      {/* Mini pipeline */}
+      {(isRunning || isPaused || isFinished) && (
+        <div className="mb-3">
+          <div className="flex gap-0.5 items-end h-6">
+            {STAGES.map(s => {
+              const q = qs[s.id];
+              const h = maxQ > 0 ? Math.max(3, (q / maxQ) * 24) : 3;
+              const c = q > 6 ? '#F85149' : q > 3 ? '#F0B429' : '#3FB950';
+              return (
+                <div key={s.id} className="flex flex-col items-center gap-0.5 flex-1">
+                  <div className="rounded-sm w-full transition-all" style={{ height: `${h}px`, backgroundColor: c }} />
+                  <span className="text-[7px] text-[#8B949E] font-mono">{s.shortName}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Stats row */}
+      <div className="flex gap-3 text-[10px] mb-3">
+        <span className="text-[#3FB950] font-mono">+${(state.revenue || 0).toLocaleString()}</span>
+        <span className="text-[#F85149] font-mono">-${Math.round(state.penalties || 0).toLocaleString()}</span>
+        {expired > 0 && <span className="text-[#F85149]">{expired} expired</span>}
+        {(state.holdingCostAccrued || 0) > 0 && <span className="text-[#F0B429]">HC: ${Math.round(state.holdingCostAccrued).toLocaleString()}</span>}
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex gap-1.5">
+        {isStaging && (
+          <button onClick={() => onAction(roomCode, { type: 'START_SIMULATION' })}
+            className="flex-1 py-1.5 text-[10px] font-bold bg-[#3FB950]/20 text-[#3FB950] border border-[#3FB950]/30 rounded-lg hover:bg-[#3FB950]/30 transition-colors">
+            Start
+          </button>
+        )}
+        {isRunning && (
+          <>
+            <button onClick={() => onAction(roomCode, { type: 'PAUSE_SIMULATION' })}
+              className="flex-1 py-1.5 text-[10px] font-bold bg-[#F0B429]/20 text-[#F0B429] border border-[#F0B429]/30 rounded-lg hover:bg-[#F0B429]/30 transition-colors">
+              Pause
+            </button>
+            <button onClick={() => onAction(roomCode, { type: 'INJECT_ORDER', urgency: 'EXPRESS' })}
+              className="flex-1 py-1.5 text-[10px] font-bold bg-[#F85149]/20 text-[#F85149] border border-[#F85149]/30 rounded-lg hover:bg-[#F85149]/30 transition-colors">
+              Inject Rush
+            </button>
+          </>
+        )}
+        {isPaused && (
+          <button onClick={() => onAction(roomCode, { type: 'RESUME_SIMULATION' })}
+            className="flex-1 py-1.5 text-[10px] font-bold bg-[#3FB950]/20 text-[#3FB950] border border-[#3FB950]/30 rounded-lg hover:bg-[#3FB950]/30 transition-colors">
+            Resume
+          </button>
+        )}
+        {isFinished && (
+          <div className="flex-1 py-1.5 text-[10px] font-bold text-[#8B949E] text-center">Simulation Complete</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TeacherView({ teacherRooms, wsSend }) {
+  const [configStockMultiplier, setConfigStockMultiplier] = useState(1.0);
+  const [configHoldingCost, setConfigHoldingCost] = useState(0);
+  const [configChipWeights, setConfigChipWeights] = useState({ ALPHA: 1, BETA: 1, GAMMA: 2 });
+  const [showConfig, setShowConfig] = useState(false);
+  const [competitionStarted, setCompetitionStarted] = useState(false);
+
+  const roomEntries = Object.entries(teacherRooms).sort(([, a], [, b]) => {
+    const order = { running: 0, paused: 1, staging: 2, lobby: 3, finished: 4 };
+    return (order[a.phase] || 5) - (order[b.phase] || 5);
+  });
+
+  const handleAction = (roomCode, action) => {
+    wsSend({ type: 'teacher_action', room: roomCode, action });
+  };
+
+  const currentConfig = { type: 'SET_GAME_CONFIG', stockMultiplier: configStockMultiplier, holdingCostRate: configHoldingCost, chipWeights: configChipWeights };
+
+  const applyConfigToAll = () => {
+    for (const [roomCode] of roomEntries) {
+      handleAction(roomCode, currentConfig);
+    }
+  };
+
+  // Competition controls
+  const stagingRooms = roomEntries.filter(([, s]) => s.phase === 'staging');
+  const runningRooms = roomEntries.filter(([, s]) => s.phase === 'running');
+  const pausedRooms = roomEntries.filter(([, s]) => s.phase === 'paused');
+  const activeRooms = roomEntries.filter(([, s]) => s.phase === 'running' || s.phase === 'paused');
+  const finishedRooms = roomEntries.filter(([, s]) => s.phase === 'finished');
+  const scoredRooms = roomEntries.filter(([, s]) => s.phase === 'running' || s.phase === 'finished' || s.phase === 'paused');
+
+  // Auto-reset competition lock when all rooms finish
+  if (competitionStarted && roomEntries.length > 0 && activeRooms.length === 0 && finishedRooms.length > 0) {
+    // All rooms finished — will reset on next render via effect below
+  }
+  useEffect(() => {
+    if (competitionStarted && roomEntries.length > 0 && activeRooms.length === 0 && finishedRooms.length > 0) {
+      setCompetitionStarted(false);
+    }
+  }, [competitionStarted, roomEntries.length, activeRooms.length, finishedRooms.length]);
+
+  const handleStartAll = () => {
+    for (const [roomCode] of stagingRooms) {
+      handleAction(roomCode, currentConfig);
+      handleAction(roomCode, { type: 'START_SIMULATION' });
+    }
+    setCompetitionStarted(true);
+  };
+
+  const handlePauseAll = () => {
+    for (const [roomCode] of runningRooms) {
+      handleAction(roomCode, { type: 'PAUSE_SIMULATION' });
+    }
+  };
+
+  const handleResumeAll = () => {
+    for (const [roomCode] of pausedRooms) {
+      handleAction(roomCode, { type: 'RESUME_SIMULATION' });
+    }
+  };
+
+  // Chip weight presets
+  const CHIP_WEIGHT_PRESETS = [
+    { label: 'Two-Coin', weights: { ALPHA: 1, BETA: 1, GAMMA: 2 }, desc: 'A:25% B:25% G:50%' },
+    { label: 'Equal', weights: { ALPHA: 1, BETA: 1, GAMMA: 1 }, desc: 'A:33% B:33% G:33%' },
+    { label: 'No GAMMA', weights: { ALPHA: 1, BETA: 1, GAMMA: 0 }, desc: 'A:50% B:50% G:0%' },
+    { label: 'GAMMA Heavy', weights: { ALPHA: 1, BETA: 1, GAMMA: 4 }, desc: 'A:17% B:17% G:67%' },
+  ];
+
+  const chipWeightTotal = Object.values(configChipWeights).reduce((s, v) => s + v, 0) || 1;
+
+  // Aggregate stats
+  const totalRooms = roomEntries.length;
+  const totalRevenue = roomEntries.reduce((sum, [, s]) => sum + (s.revenue || 0), 0);
+  const totalOps = roomEntries.reduce((sum, [, s]) => sum + Object.keys(s.operators || {}).length, 0);
+
+  // Leaderboard data
+  const leaderboard = scoredRooms
+    .map(([code, s]) => {
+      const score = (s.revenue || 0) - (s.penalties || 0) - (s.hasSecondOven ? SECOND_OVEN_COST : 0);
+      const tp = s.elapsedTime > 0 ? ((s.shippedChips?.length || 0) / (s.elapsedTime / 60)).toFixed(1) : '0.0';
+      const fulfilled = s.orders?.filter(o => o.status === 'shipped').length || 0;
+      const totalOrders = s.orders?.length || 0;
+      const fulfillRate = totalOrders > 0 ? Math.round((fulfilled / totalOrders) * 100) : 0;
+      return { code, score, tp, fulfillRate, phase: s.phase, ops: Object.keys(s.operators || {}).length, round: s.round || 0 };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const leaderScore = leaderboard.length > 0 ? leaderboard[0].score : 0;
+  const allFinished = scoredRooms.length > 0 && scoredRooms.every(([, s]) => s.phase === 'finished');
+
+  return (
+    <div className="min-h-screen bg-[#0D1117] text-white">
+      {/* Top Bar */}
+      <div className="bg-[#161B22] border-b border-[#30363D] px-4 py-2">
+        <div className="flex items-center justify-between max-w-[1400px] mx-auto">
+          <div className="flex items-center gap-4">
+            <h1 className="text-sm font-black tracking-wider text-[#F0B429]">LEGO CHIP FACTORY</h1>
+            <span className="text-xs px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded font-bold">TEACHER</span>
+            {competitionStarted && <span className="text-[10px] px-2 py-0.5 bg-[#F0B429]/20 text-[#F0B429] rounded-full font-bold animate-pulse">COMPETITION ACTIVE</span>}
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5 bg-[#0D1117] px-2.5 py-1 rounded-lg border border-[#21262D]">
+              <span className="text-[10px] text-[#8B949E]">Rooms</span>
+              <span className="text-[10px] font-bold font-mono text-white">{totalRooms}</span>
+              <span className="text-[10px] text-[#3FB950]">({activeRooms.length} active)</span>
+            </div>
+            <div className="flex items-center gap-1.5 bg-[#0D1117] px-2.5 py-1 rounded-lg border border-[#21262D]">
+              <span className="text-[10px] text-[#8B949E]">Operators</span>
+              <span className="text-[10px] font-bold font-mono text-white">{totalOps}</span>
+            </div>
+            <div className="text-right">
+              <div className="text-[10px] text-[#8B949E]">Total Revenue</div>
+              <div className="text-sm font-mono font-bold text-[#3FB950]">${totalRevenue.toLocaleString()}</div>
+            </div>
+            {/* Competition quick actions */}
+            {stagingRooms.length > 0 && (
+              <button onClick={handleStartAll}
+                className="px-3 py-1.5 text-[10px] font-bold bg-[#3FB950]/20 text-[#3FB950] border border-[#3FB950]/30 rounded-lg hover:bg-[#3FB950]/30 transition-colors">
+                Start All ({stagingRooms.length})
+              </button>
+            )}
+            {runningRooms.length > 0 && (
+              <button onClick={handlePauseAll}
+                className="px-3 py-1.5 text-[10px] font-bold bg-[#F0B429]/20 text-[#F0B429] border border-[#F0B429]/30 rounded-lg hover:bg-[#F0B429]/30 transition-colors">
+                Pause All
+              </button>
+            )}
+            {pausedRooms.length > 0 && (
+              <button onClick={handleResumeAll}
+                className="px-3 py-1.5 text-[10px] font-bold bg-[#3FB950]/20 text-[#3FB950] border border-[#3FB950]/30 rounded-lg hover:bg-[#3FB950]/30 transition-colors">
+                Resume All
+              </button>
+            )}
+            <button onClick={() => setShowConfig(!showConfig)}
+              className={`px-3 py-1.5 text-[10px] font-bold border rounded-lg transition-colors ${showConfig ? 'bg-purple-500/20 text-purple-400 border-purple-500/30' : 'bg-[#0D1117] text-[#8B949E] border-[#30363D] hover:border-purple-500/30 hover:text-purple-400'}`}>
+              Config
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-[1400px] mx-auto px-4 py-4">
+        {/* Config Panel */}
+        {showConfig && (
+          <div className={`bg-[#161B22] border rounded-xl p-4 mb-4 animate-slide-in ${competitionStarted ? 'border-[#F0B429]/30 opacity-60' : 'border-purple-500/30'}`}>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-bold text-purple-400 uppercase tracking-wider">Game Configuration</h3>
+              {competitionStarted && <span className="text-[9px] text-[#F0B429] font-bold">LOCKED — Competition Active</span>}
+            </div>
+            <fieldset disabled={competitionStarted}>
+            <div className="grid grid-cols-3 gap-4">
+              {/* Stock Multiplier */}
+              <div>
+                <label className="text-[10px] text-[#8B949E] uppercase font-bold mb-2 block">Starting Stock Multiplier</label>
+                <div className="flex gap-1.5">
+                  {[0.5, 0.75, 1.0, 1.5, 2.0].map(m => (
+                    <button key={m} onClick={() => setConfigStockMultiplier(m)}
+                      className={`flex-1 py-1.5 text-[10px] font-bold rounded-lg border transition-colors ${configStockMultiplier === m ? 'bg-purple-500/20 text-purple-400 border-purple-500/40' : 'bg-[#0D1117] text-[#8B949E] border-[#30363D] hover:border-purple-500/30'}`}>
+                      {m}x
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[8px] text-[#30363D] mt-1">Base stock: {Object.entries(INITIAL_STOCK).map(([c, v]) => `${c}:${Math.round(v * configStockMultiplier)}`).join(', ')}</p>
+              </div>
+
+              {/* Holding Cost */}
+              <div>
+                <label className="text-[10px] text-[#8B949E] uppercase font-bold mb-2 block">Holding Cost ($/unit/tick)</label>
+                <div className="flex gap-1.5">
+                  {[0, 0.25, 0.5, 1.0, 2.0].map(c => (
+                    <button key={c} onClick={() => setConfigHoldingCost(c)}
+                      className={`flex-1 py-1.5 text-[10px] font-bold rounded-lg border transition-colors ${configHoldingCost === c ? 'bg-purple-500/20 text-purple-400 border-purple-500/40' : 'bg-[#0D1117] text-[#8B949E] border-[#30363D] hover:border-purple-500/30'}`}>
+                      ${c}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[8px] text-[#30363D] mt-1">{configHoldingCost > 0 ? `~$${Math.round(Object.values(INITIAL_STOCK).reduce((s, v) => s + v, 0) * configStockMultiplier * configHoldingCost)}/tick at full stock` : 'Disabled — no inventory drain'}</p>
+              </div>
+
+              {/* Chip Weight Presets */}
+              <div>
+                <label className="text-[10px] text-[#8B949E] uppercase font-bold mb-2 block">Order Chip Distribution</label>
+                <div className="flex gap-1.5">
+                  {CHIP_WEIGHT_PRESETS.map(p => {
+                    const match = p.weights.ALPHA === configChipWeights.ALPHA && p.weights.BETA === configChipWeights.BETA && p.weights.GAMMA === configChipWeights.GAMMA;
+                    return (
+                      <button key={p.label} onClick={() => setConfigChipWeights({ ...p.weights })}
+                        className={`flex-1 py-1.5 text-[10px] font-bold rounded-lg border transition-colors ${match ? 'bg-purple-500/20 text-purple-400 border-purple-500/40' : 'bg-[#0D1117] text-[#8B949E] border-[#30363D] hover:border-purple-500/30'}`}>
+                        {p.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-[8px] text-[#30363D] mt-1">
+                  A:{Math.round((configChipWeights.ALPHA / chipWeightTotal) * 100)}%
+                  B:{Math.round((configChipWeights.BETA / chipWeightTotal) * 100)}%
+                  G:{Math.round((configChipWeights.GAMMA / chipWeightTotal) * 100)}%
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 mt-3">
+              <button onClick={applyConfigToAll}
+                className="px-4 py-1.5 text-[10px] font-bold bg-purple-500/20 text-purple-400 border border-purple-500/30 rounded-lg hover:bg-purple-500/30 transition-colors">
+                Apply to All Rooms
+              </button>
+              <p className="text-[9px] text-[#8B949E] self-center">Sets stock, holding cost, and chip distribution for all rooms. Best applied during staging.</p>
+            </div>
+            </fieldset>
+          </div>
+        )}
+
+        {/* Room Grid */}
+        {roomEntries.length === 0 ? (
+          <div className="text-center py-16">
+            <div className="text-5xl mb-4">🎓</div>
+            <h2 className="text-xl font-bold text-[#F0B429] mb-2">No Active Rooms</h2>
+            <p className="text-sm text-[#8B949E]">Waiting for Directors to create rooms...</p>
+            <div className="flex justify-center gap-1 mt-4">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '0ms' }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '150ms' }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-[#F0B429] animate-bounce" style={{ animationDelay: '300ms' }} />
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {roomEntries.map(([code, roomState]) => (
+              <TeacherRoomCard key={code} roomCode={code} state={roomState} onAction={handleAction} />
+            ))}
+          </div>
+        )}
+
+        {/* Leaderboard — always visible when rooms have scores */}
+        {leaderboard.length > 0 && (
+          <div className={`mt-4 bg-[#161B22] border rounded-xl p-4 ${allFinished ? 'border-[#F0B429]/50' : 'border-[#30363D]'}`}>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-bold text-[#F0B429] uppercase tracking-wider">
+                {allFinished ? 'Competition Complete — Final Rankings' : 'Leaderboard'}
+              </h3>
+              {allFinished && leaderboard.length > 0 && (
+                <span className="text-[10px] font-bold text-[#F0B429]">Winner: {leaderboard[0].code}</span>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              {leaderboard.map((entry, i) => (
+                <div key={entry.code} className={`flex items-center justify-between px-3 py-2 rounded-lg ${i === 0 ? 'bg-[#F0B429]/10 border border-[#F0B429]/30' : 'bg-[#0D1117] border border-[#21262D]'}`}>
+                  <div className="flex items-center gap-3">
+                    <span className={`text-sm font-bold font-mono ${i === 0 ? 'text-[#F0B429]' : 'text-[#8B949E]'}`}>#{i + 1}</span>
+                    <span className="text-sm font-mono font-bold text-white tracking-wider">{entry.code}</span>
+                    <span className="text-[10px] text-[#8B949E]">{entry.ops} ops</span>
+                    <span className="text-[10px] text-[#8B949E]">R{entry.round}/10</span>
+                    {entry.phase === 'finished' && <span className="text-[8px] px-1 py-0.5 bg-[#8B949E]/15 text-[#8B949E] rounded">DONE</span>}
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="text-[10px] font-mono text-[#8B949E]">{entry.fulfillRate}% filled</span>
+                    <span className="text-[10px] font-mono text-cyan">{entry.tp}/min</span>
+                    {i > 0 && <span className="text-[10px] font-mono text-[#F85149]">{entry.score - leaderScore >= 0 ? '' : ''}{(entry.score - leaderScore).toLocaleString()}</span>}
+                    <span className={`text-sm font-mono font-bold ${entry.score >= 0 ? 'text-[#3FB950]' : 'text-[#F85149]'}`}>${entry.score.toLocaleString()}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {/* Competition complete summary */}
+            {allFinished && leaderboard.length > 1 && (
+              <div className="mt-3 pt-3 border-t border-[#30363D] grid grid-cols-3 gap-4 text-center">
+                <div>
+                  <div className="text-[8px] text-[#8B949E] uppercase">Best Throughput</div>
+                  <div className="text-xs font-mono font-bold text-cyan">
+                    {[...leaderboard].sort((a, b) => parseFloat(b.tp) - parseFloat(a.tp))[0].code} ({[...leaderboard].sort((a, b) => parseFloat(b.tp) - parseFloat(a.tp))[0].tp}/min)
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[8px] text-[#8B949E] uppercase">Best Fulfillment</div>
+                  <div className="text-xs font-mono font-bold text-[#3FB950]">
+                    {[...leaderboard].sort((a, b) => b.fulfillRate - a.fulfillRate)[0].code} ({[...leaderboard].sort((a, b) => b.fulfillRate - a.fulfillRate)[0].fulfillRate}%)
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[8px] text-[#8B949E] uppercase">Highest Score</div>
+                  <div className="text-xs font-mono font-bold text-[#F0B429]">
+                    {leaderboard[0].code} (${leaderboard[0].score.toLocaleString()})
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── DEBRIEF SCREEN ──────────────────────────────────────────────────────────
 function DebriefScreen({ state, onRestart }) {
   const el = state.elapsedTime || SIM_DURATION;
@@ -1524,6 +2007,7 @@ function DebriefScreen({ state, onRestart }) {
             <span className="text-[#3FB950]">+${state.revenue.toLocaleString()} revenue</span>
             <span className="text-[#F85149]">-${state.penalties.toLocaleString()} penalties</span>
             {state.hasSecondOven && <span className="text-[#F85149]">-$2,000 oven</span>}
+            {(state.holdingCostAccrued || 0) > 0 && <span className="text-[#F0B429]">-${Math.round(state.holdingCostAccrued).toLocaleString()} holding</span>}
           </div>
         </div>
         <div className="grid grid-cols-4 gap-3 mb-6">
@@ -1544,6 +2028,13 @@ function DebriefScreen({ state, onRestart }) {
               <p className="text-white">+{tEC} additional chips welded</p>
               <p className="text-[#3FB950] font-mono font-bold">≈ +${wIR.toLocaleString()} potential revenue</p>
               {!state.hasSecondOven && <p className="text-[#F0B429] mt-2 text-[10px]">You did not purchase the 2nd oven.</p>}
+              {(state.holdingCostAccrued || 0) > 0 && (
+                <div className="mt-2 pt-2 border-t border-[#21262D]">
+                  <p className="text-[#F0B429] text-[10px] font-bold">Holding Cost Impact</p>
+                  <p className="text-[#8B949E] text-[10px]">Total holding cost: <span className="text-[#F85149] font-mono">${Math.round(state.holdingCostAccrued).toLocaleString()}</span></p>
+                  <p className="text-[#8B949E] text-[10px]">Rate: ${state.holdingCostRate}/unit/tick — lean inventory reduces this cost</p>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1556,12 +2047,14 @@ function DebriefScreen({ state, onRestart }) {
 
 // ─── LOBBY ───────────────────────────────────────────────────────────────────
 function Lobby({ onJoin, urlRoom }) {
-  const [phase, setPhase] = useState(urlRoom ? 'join' : 'home'); // home | join | create
+  const [phase, setPhase] = useState(urlRoom ? 'join' : 'home'); // home | join | create | teacher_auth
   const [roomCode, setRoomCode] = useState(urlRoom || '');
   const [name, setName] = useState('');
   const [role, setRole] = useState(urlRoom ? 'operator' : 'director');
   const [activeSessions, setActiveSessions] = useState([]);
   const [joinError, setJoinError] = useState('');
+  const [teacherPassword, setTeacherPassword] = useState('');
+  const [teacherAuthError, setTeacherAuthError] = useState('');
 
   // Fetch active rooms from WebSocket server
   useEffect(() => {
@@ -1595,9 +2088,67 @@ function Lobby({ onJoin, urlRoom }) {
   };
 
   const handleSubmit = () => {
+    if (role === 'teacher') {
+      setPhase('teacher_auth');
+      return;
+    }
     if (!name.trim() || !roomCode) return;
     onJoin(name.trim(), role, roomCode.toUpperCase());
   };
+
+  const handleTeacherAuth = () => {
+    if (!name.trim() || !teacherPassword.trim()) return;
+    setTeacherAuthError('');
+    // Try to authenticate via WebSocket
+    const ws = new WebSocket(WS_URL);
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'teacher_join', password: teacherPassword }));
+    };
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'teacher_auth_ok') {
+          ws.close();
+          onJoin(name.trim(), 'teacher', '__teacher__', teacherPassword);
+        } else if (msg.type === 'teacher_auth_fail') {
+          ws.close();
+          setTeacherAuthError('Invalid password');
+        }
+      } catch {}
+    };
+    ws.onerror = () => { setTeacherAuthError('Connection failed'); };
+  };
+
+  // Teacher authentication screen
+  if (phase === 'teacher_auth') return (
+    <div className="min-h-screen bg-[#0D1117] text-white flex items-center justify-center">
+      <div className="w-full max-w-md animate-fade-in">
+        <div className="text-center mb-6">
+          <div className="text-4xl mb-3">🎓</div>
+          <h1 className="text-xl font-black tracking-wider text-purple-400 mb-1">TEACHER LOGIN</h1>
+          <p className="text-xs text-[#8B949E]">Enter the teacher password to access the dashboard</p>
+        </div>
+        <div className="bg-[#161B22] border border-purple-500/30 rounded-xl p-6">
+          <div className="mb-4">
+            <label className="text-xs font-bold text-[#8B949E] uppercase tracking-wider mb-1.5 block">Password</label>
+            <input type="password" value={teacherPassword} onChange={e => { setTeacherPassword(e.target.value); setTeacherAuthError(''); }}
+              placeholder="Enter teacher password"
+              onKeyDown={e => e.key === 'Enter' && handleTeacherAuth()}
+              className="w-full bg-[#0D1117] border border-[#30363D] rounded-lg px-3 py-2.5 text-sm text-white placeholder-[#30363D] focus:border-purple-500 focus:outline-none transition-colors" />
+            {teacherAuthError && <p className="text-[10px] text-[#F85149] mt-1.5">{teacherAuthError}</p>}
+          </div>
+          <button onClick={handleTeacherAuth} disabled={!teacherPassword.trim()}
+            className="w-full py-3 bg-purple-500 text-white font-bold rounded-lg text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:bg-purple-500/90 transition-colors">
+            Enter Teacher Dashboard
+          </button>
+        </div>
+        <button onClick={() => { setPhase(roomCode ? 'join' : 'create'); setTeacherPassword(''); setTeacherAuthError(''); }}
+          className="w-full mt-3 py-2 text-xs text-[#8B949E] hover:text-white transition-colors">
+          ← Back
+        </button>
+      </div>
+    </div>
+  );
 
   // Home screen — Create or Join
   if (phase === 'home') return (
@@ -1711,7 +2262,7 @@ function Lobby({ onJoin, urlRoom }) {
             <div className="grid grid-cols-3 gap-2">
               {[{ id: 'director', icon: '🎯', label: 'Director', desc: 'Assign operators. Observe production. Strategy only.' },
                 { id: 'operator', icon: '🔧', label: 'Operator', desc: 'Hands-on! Build chips, pick bricks, ship orders.' },
-                { id: 'observer', icon: '👁️', label: 'Observer', desc: 'Watch the factory. Dashboard view, read-only.' }
+                { id: 'teacher', icon: '🎓', label: 'Teacher', desc: 'Monitor all rooms. Control sims. Set parameters.' }
               ].map(r => (
                 <button key={r.id} onClick={() => setRole(r.id)} className={`p-3 rounded-lg border text-left transition-all ${role === r.id ? 'border-[#F0B429] bg-[#F0B429]/10' : 'border-[#30363D] bg-[#0D1117] hover:border-[#8B949E]'}`}>
                   <div className="text-2xl mb-1">{r.icon}</div>
@@ -1723,7 +2274,7 @@ function Lobby({ onJoin, urlRoom }) {
           </div>
           <button onClick={handleSubmit} disabled={!name.trim()}
             className="w-full py-3 bg-[#F0B429] text-[#0D1117] font-bold rounded-lg text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:bg-[#F0B429]/90 transition-colors">
-            Enter Factory
+            {role === 'teacher' ? 'Continue to Login' : 'Enter Factory'}
           </button>
         </div>
 
@@ -1742,6 +2293,8 @@ export default function App() {
   const [role, setRole] = useState(null);
   const [playerName, setPlayerName] = useState('');
   const [playerId] = useState(genId);
+  const [teacherRooms, setTeacherRooms] = useState({});
+  const [teacherPwd, setTeacherPwd] = useState('');
   const intervalRef = useRef(null);
   const wsRef = useRef(null);
   const stateRef = useRef(state);
@@ -1753,7 +2306,9 @@ export default function App() {
 
   // ── WEBSOCKET CONNECTION ──
   useEffect(() => {
-    if (!role || !roomCode) return;
+    if (!role) return;
+    // Non-teacher roles need a room code
+    if (role !== 'teacher' && !roomCode) return;
 
     let ws;
     let reconnectTimer;
@@ -1765,11 +2320,16 @@ export default function App() {
 
       ws.onopen = () => {
         retryDelay = 500;
-        // Join the room
-        ws.send(JSON.stringify({ type: 'join', room: roomCode, role, id: playerId, name: playerName }));
-        // If Director, send current state so server has it for late joiners
-        if (roleRef.current === 'director' && stateRef.current.phase !== 'lobby') {
-          ws.send(JSON.stringify({ type: 'state_update', state: stateRef.current }));
+        if (roleRef.current === 'teacher') {
+          // Teacher authenticates with password
+          ws.send(JSON.stringify({ type: 'teacher_join', password: teacherPwd }));
+        } else {
+          // Join the room
+          ws.send(JSON.stringify({ type: 'join', room: roomCode, role, id: playerId, name: playerName }));
+          // If Director, send current state so server has it for late joiners
+          if (roleRef.current === 'director' && stateRef.current.phase !== 'lobby') {
+            ws.send(JSON.stringify({ type: 'state_update', state: stateRef.current }));
+          }
         }
       };
 
@@ -1780,21 +2340,25 @@ export default function App() {
         switch (msg.type) {
           case 'state_update':
             // Non-directors receive state from Director via server
-            if (roleRef.current !== 'director') {
+            if (roleRef.current !== 'director' && roleRef.current !== 'teacher') {
               dispatch({ type: 'SET_STATE', state: msg.state });
             }
             break;
+          case 'room_state':
+            // Teacher receives state from all rooms
+            if (roleRef.current === 'teacher') {
+              setTeacherRooms(prev => ({ ...prev, [msg.room]: msg.state }));
+            }
+            break;
           case 'action':
-            // Director receives actions from operators via server
+            // Director receives actions from operators/teacher via server
             if (roleRef.current === 'director') {
               dispatch(msg.action);
             }
             break;
           case 'client_joined':
-            // Server notifies Director that an operator joined — they'll send ADD_OPERATOR via action
             break;
           case 'client_left':
-            // Could remove operator — but they might reconnect, so leave them
             break;
         }
       };
@@ -1818,7 +2382,7 @@ export default function App() {
       if (ws) { ws.onclose = null; ws.close(); }
       wsRef.current = null;
     };
-  }, [role, roomCode, playerId, playerName]);
+  }, [role, roomCode, playerId, playerName, teacherPwd]);
 
   // ── DIRECTOR: broadcast state via WebSocket on every change ──
   useEffect(() => {
@@ -1846,10 +2410,16 @@ export default function App() {
     }
   }, []);
 
-  const handleJoin = useCallback((name, selectedRole, room) => {
+  const handleJoin = useCallback((name, selectedRole, room, password) => {
     setPlayerName(name);
     setRole(selectedRole);
     setRoomCode(room);
+
+    if (selectedRole === 'teacher') {
+      setTeacherPwd(password || '');
+      // Teacher doesn't join a specific room — WS effect will handle auth
+      return;
+    }
 
     // Update URL to include room code
     const url = new URL(window.location);
@@ -1871,11 +2441,6 @@ export default function App() {
       return;
     }
 
-    if (selectedRole === 'observer') {
-      // Observer — server will send current state on WS connect
-      return;
-    }
-
     if (selectedRole === 'director') {
       dispatch({ type: 'SET_STATE', state: createInitialState(room) });
       dispatch({ type: 'START_STAGING' });
@@ -1891,7 +2456,16 @@ export default function App() {
     setRoomCode(null);
   }, []);
 
+  // ── TEACHER SEND HELPER ──
+  const teacherSend = useCallback((msg) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify(msg));
+    }
+  }, []);
+
   if (!role) return <Lobby onJoin={handleJoin} urlRoom={getRoomFromURL()} />;
+  if (role === 'teacher') return <TeacherView teacherRooms={teacherRooms} wsSend={teacherSend} />;
   if (state.phase === 'finished') return <DebriefScreen state={state} onRestart={handleRestart} />;
   if (state.phase === 'lobby') return (
     <div className="min-h-screen bg-[#0D1117] text-white flex items-center justify-center">

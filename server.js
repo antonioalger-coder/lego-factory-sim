@@ -8,9 +8,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8080;
 const STALE_ROOM_MS = 2 * 60 * 60 * 1000; // 2 hours
 const HEARTBEAT_INTERVAL = 30000;
+const TEACHER_PASSWORD = process.env.TEACHER_PASSWORD || 'lego2024';
 
 // ─── Room Management ────────────────────────────────────────────────────────
 const rooms = new Map(); // roomCode → { director, clients: Map<ws, {id, name, role}>, createdAt, lastState }
+const teachers = new Set(); // Set<ws> — authenticated teacher connections
 
 function getOrCreateRoom(code) {
   if (!rooms.has(code)) {
@@ -20,6 +22,7 @@ function getOrCreateRoom(code) {
 }
 
 function removeClient(ws) {
+  teachers.delete(ws);
   for (const [code, room] of rooms) {
     if (!room.clients.has(ws)) continue;
     const client = room.clients.get(ws);
@@ -135,11 +138,15 @@ wss.on('connection', (ws) => {
       }
 
       case 'state_update': {
-        // From Director → broadcast to all others in room
+        // From Director → broadcast to all others in room + teachers
         for (const [code, room] of rooms) {
           if (!room.clients.has(ws)) continue;
           room.lastState = msg.state;
           broadcastToRoom(code, { type: 'state_update', state: msg.state }, ws);
+          // Forward to all authenticated teachers
+          for (const tws of teachers) {
+            safeSend(tws, { type: 'room_state', room: code, state: msg.state });
+          }
           break;
         }
         break;
@@ -159,6 +166,31 @@ wss.on('connection', (ws) => {
 
       case 'get_rooms': {
         safeSend(ws, { type: 'room_list', rooms: getActiveRooms() });
+        break;
+      }
+
+      case 'teacher_join': {
+        if (msg.password !== TEACHER_PASSWORD) {
+          safeSend(ws, { type: 'teacher_auth_fail' });
+          return;
+        }
+        teachers.add(ws);
+        safeSend(ws, { type: 'teacher_auth_ok' });
+        // Send current state of all active rooms
+        for (const [code, room] of rooms) {
+          if (room.lastState) {
+            safeSend(ws, { type: 'room_state', room: code, state: room.lastState });
+          }
+        }
+        break;
+      }
+
+      case 'teacher_action': {
+        if (!teachers.has(ws)) return;
+        const targetRoom = rooms.get(msg.room);
+        if (targetRoom && targetRoom.director) {
+          safeSend(targetRoom.director, { type: 'action', action: msg.action });
+        }
         break;
       }
     }
